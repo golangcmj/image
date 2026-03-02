@@ -144,6 +144,29 @@ function scheduleRenderRetry(messageId, attempt, reason) {
 }
 
 /**
+ * Re-process recent messages, used as a safety net after editor/re-render operations.
+ * @param {number} limit
+ * @param {number} delayMs
+ */
+function reprocessRecentMessages(limit = 30, delayMs = 80) {
+    const context = getContext();
+    const chat = context.chat || [];
+    if (!chat.length) return;
+
+    const start = Math.max(0, chat.length - Math.max(1, limit));
+    let offset = 0;
+    for (let i = start; i < chat.length; i++) {
+        processedMessages.delete(i);
+        setTimeout(() => {
+            onMessageRendered(i).catch(err => {
+                console.error('[PixAI] reprocessRecentMessages error:', err);
+            });
+        }, offset);
+        offset += delayMs;
+    }
+}
+
+/**
  * Check whether a text node is inside a visible/rendered DOM branch.
  * @param {Text} textNode
  * @param {Node} root
@@ -460,7 +483,7 @@ async function onMessageRendered(messageRef, attempt = 0) {
 
     if (matches.length) {
         const inserted = showGenerateTrigger(mesEl, messageText, messageId);
-        if (!inserted && !hasExtra) {
+        if (!inserted && !settings.autoGenerate) {
             scheduleRenderRetry(messageId, attempt, 'generate trigger insertion skipped');
             return;
         }
@@ -588,6 +611,7 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
     console.log(`[PixAI-DEBUG] mesBody innerHTML (first 200): "${mesBody.html().substring(0, 200)}"`);
     console.log(`[PixAI-DEBUG] triggerRegex: "${triggerRegex}"`);
 
+    let handledCount = 0;
     let insertedCount = 0;
     for (let i = 0; i < matches.length; i++) {
         const match = matches[i];
@@ -599,7 +623,15 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
             .find('.pixai-generate-trigger, .pixai-image-container')
             .filter((_, el) => $(el).attr('data-marker-key') === markerKey)
             .length > 0;
-        if (hasMarkerAlready) continue;
+        const normalizedPrompt = String(prompt).trim();
+        const hasPromptAlready = mesBody
+            .find('.pixai-generate-trigger, .pixai-image-container')
+            .filter((_, el) => String($(el).attr('data-prompt') || '').trim() === normalizedPrompt)
+            .length > 0;
+        if (hasMarkerAlready || hasPromptAlready) {
+            handledCount++;
+            continue;
+        }
 
         const btn = $('<button>')
             .addClass('pixai-generate-trigger')
@@ -645,15 +677,15 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
             }
         }
 
-        if (!replaced) {
-            console.log(`[PixAI-DEBUG] fallback: appending btn to mesBody (marker=${markerKey})`);
-            mesBody.append(btn);
+        if (replaced) {
+            insertedCount++;
+            handledCount++;
+        } else {
+            console.log(`[PixAI-DEBUG] skip unmatched marker without append (marker=${markerKey})`);
         }
-
-        insertedCount++;
     }
 
-    console.log(`[PixAI-DEBUG] html final-pass replaced=${insertedCount}`);
+    console.log(`[PixAI-DEBUG] html final-pass replaced=${insertedCount}, handled=${handledCount}, total=${matches.length}`);
 
     // Verify button exists in DOM after insertion
     setTimeout(() => {
@@ -665,7 +697,7 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
         }
     }, 100);
 
-    return true;
+    return handledCount > 0;
 }
 
 /**
@@ -1056,7 +1088,12 @@ function getMessageBody(mesEl) {
     if (!mesEl?.length) return $();
     const visible = mesEl.find('.mes_text:visible').first();
     if (visible.length) return visible;
-    return mesEl.find('.mes_text').first();
+    // Fallback: choose the most likely active body instead of returning empty.
+    const candidates = mesEl.find('.mes_text').filter((_, el) =>
+        !$(el).closest('[aria-hidden="true"], .hidden, .displayNone, .st-hidden').length,
+    );
+    if (candidates.length) return candidates.last();
+    return mesEl.find('.mes_text').last();
 }
 
 // ============ Story Share ============
@@ -1778,14 +1815,44 @@ jQuery(async () => {
     // Handle message edits — re-process the edited message
     eventSource.on(event_types.MESSAGE_EDITED, (messagePayload) => {
         const messageId = normalizeMessageIndex(messagePayload);
-        if (messageId == null) return;
+        if (messageId == null) {
+            console.warn('[PixAI] MESSAGE_EDITED without resolvable id, fallback to recent message reprocess');
+            setTimeout(() => reprocessRecentMessages(40, 60), 250);
+            setTimeout(() => reprocessRecentMessages(40, 60), 900);
+            return;
+        }
+
+        // Some edit flows render twice; run a delayed second pass to avoid marker rollback.
         processedMessages.delete(messageId);
         setTimeout(() => {
             onMessageRendered(messageId).catch(err => {
                 console.error('[PixAI] onMessageRendered error:', err);
             });
-        }, 200);
+        }, 220);
+        setTimeout(() => {
+            processedMessages.delete(messageId);
+            onMessageRendered(messageId).catch(err => {
+                console.error('[PixAI] onMessageRendered error:', err);
+            });
+        }, 900);
     });
+
+    // Compatibility: some ST versions emit MESSAGE_UPDATED instead of MESSAGE_EDITED.
+    if (event_types.MESSAGE_UPDATED) {
+        eventSource.on(event_types.MESSAGE_UPDATED, (messagePayload) => {
+            const messageId = normalizeMessageIndex(messagePayload);
+            if (messageId == null) {
+                setTimeout(() => reprocessRecentMessages(40, 60), 250);
+                return;
+            }
+            processedMessages.delete(messageId);
+            setTimeout(() => {
+                onMessageRendered(messageId).catch(err => {
+                    console.error('[PixAI] onMessageRendered error:', err);
+                });
+            }, 260);
+        });
+    }
 
     // Handle message swipes — reset and re-process
     eventSource.on(event_types.MESSAGE_SWIPED, () => {
