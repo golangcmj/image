@@ -505,22 +505,9 @@ async function onMessageRendered(messageRef, attempt = 0) {
         return;
     }
 
-    if (!settings.autoGenerate) {
-        processedMessages.add(messageId);
-        return;
-    }
-
-    if (processedMessages.has(messageId)) return;
-
-    const prompt = extractPromptFromMatch(matches[0]);
-    if (!prompt) {
-        console.warn(`[PixAI] Trigger matched but prompt extraction failed on message ${messageId}`);
-        return;
-    }
-
+    // Auto-generate path is intentionally disabled: generation must be user-initiated via button click.
     processedMessages.add(messageId);
-
-    await doGenerate(mesEl, prompt, messageId, { markerKey: `${messageId}:0` });
+    return;
 }
 
 /**
@@ -707,6 +694,10 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
  * @param {number} messageIndex
  */
 async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
+    if (!options.userInitiated && !getSettings().autoGenerate) {
+        throw new Error('自动生图已关闭，请点击按钮手动生成');
+    }
+
     const mesBody = getMessageBody(mesEl);
 
     // Show loading spinner
@@ -1622,6 +1613,10 @@ jQuery(async () => {
         extension_settings[MODULE_NAME] = { ...defaultSettings };
     }
     const settings = getSettings();
+    if (settings.autoGenerate) {
+        settings.autoGenerate = false;
+        saveSettingsDebounced();
+    }
 
     // Load settings HTML into SillyTavern settings panel
     try {
@@ -1680,14 +1675,6 @@ jQuery(async () => {
         .val(settings.globalNegativePrompt)
         .on('input', function () {
             settings.globalNegativePrompt = $(this).val();
-            saveSettingsDebounced();
-        });
-
-    // Auto generate
-    $('#pixai_auto_generate')
-        .prop('checked', settings.autoGenerate)
-        .on('change', function () {
-            settings.autoGenerate = $(this).prop('checked');
             saveSettingsDebounced();
         });
 
@@ -1755,7 +1742,7 @@ jQuery(async () => {
         $btn.data('pixaiBusy', true);
         $btn.prop('disabled', true).text('⏳ 生成中...');
         try {
-            await doGenerate(mesEl, prompt, messageIndex, { triggerButton: $btn, markerKey });
+            await doGenerate(mesEl, prompt, messageIndex, { triggerButton: $btn, markerKey, userInitiated: true });
         } catch (err) {
             $btn.prop('disabled', false).text('🎨 重试生成');
             const mesBody = getMessageBody(mesEl);
