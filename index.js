@@ -1376,6 +1376,19 @@ class HUDManager {
         const hudEl = $(hudHtml);
         $('body').append(hudEl);
         this.el = hudEl;
+        this.el.removeClass('pixai-hud-expanded').addClass('pixai-hud-collapsed');
+
+        // Mobile fallback: enforce visible anchor position even when theme CSS overrides extension styles.
+        if (window.matchMedia('(hover: none), (pointer: coarse)').matches) {
+            this.el.css({
+                bottom: 'calc(env(safe-area-inset-bottom, 0px) + 72px)',
+                right: 'calc(env(safe-area-inset-right, 0px) + 10px)',
+                zIndex: '2147483000',
+                display: 'block',
+                opacity: '1',
+                visibility: 'visible',
+            });
+        }
 
         // Badge click -> expand
         hudEl.find('.pixai-hud-badge').on('click', () => this.toggle());

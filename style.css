@@ -429,6 +429,9 @@
     right: 20px;
     z-index: 10000;
     font-family: 'Segoe UI', system-ui, sans-serif;
+    display: block;
+    opacity: 1;
+    visibility: visible;
 }
 
 /* Badge (collapsed state) */
@@ -445,6 +448,7 @@
     box-shadow: 0 0 15px rgba(0, 240, 255, 0.3);
     transition: all 0.3s ease;
     position: relative;
+    visibility: visible;
 }
 
 .pixai-hud-badge-icon {
@@ -669,8 +673,9 @@
     }
 
     .pixai-hud {
-        bottom: 10px;
-        right: 10px;
+        bottom: calc(env(safe-area-inset-bottom, 0px) + 72px);
+        right: calc(env(safe-area-inset-right, 0px) + 10px);
+        z-index: 2147483000;
     }
 
     .pixai-hud-badge {
@@ -708,5 +713,52 @@
 
     .pixai-hud-panel {
         width: 260px;
+    }
+}
+
+/* Mobile-first fallback: many devices report wide CSS viewport, so don't rely only on max-width. */
+@media (hover: none), (pointer: coarse) {
+    .pixai-hud {
+        bottom: calc(env(safe-area-inset-bottom, 0px) + 72px);
+        right: calc(env(safe-area-inset-right, 0px) + 10px);
+        z-index: 2147483000;
+    }
+
+    .pixai-hud-badge {
+        min-width: 108px;
+        width: auto;
+        height: 46px;
+        border-radius: 999px;
+        padding: 0 12px;
+        gap: 8px;
+        justify-content: flex-start;
+    }
+
+    .pixai-hud-badge-icon,
+    .pixai-hud-badge-label {
+        display: inline-block;
+    }
+
+    .pixai-hud-balance {
+        margin-left: auto;
+        min-width: 28px;
+        height: 22px;
+        line-height: 20px;
+        text-align: center;
+        padding: 0 6px;
+        border-radius: 999px;
+        border: 1px solid rgba(0, 240, 255, 0.3);
+        background: rgba(0, 240, 255, 0.12);
+        font-size: 12px;
+    }
+
+    .pixai-hud-ring {
+        inset: -3px;
+        border-radius: 999px;
+    }
+
+    .pixai-hud-panel {
+        width: min(92vw, 320px);
+        max-height: 70vh;
     }
 }
