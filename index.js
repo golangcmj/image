@@ -26,6 +26,7 @@ const POLL_INTERVAL_MS = 3000;
 const MAX_POLL_ATTEMPTS = 100; // ~5 minutes at 3s interval
 const RENDER_RETRY_DELAY_MS = 250;
 const MAX_RENDER_RETRIES = 8;
+const MAX_STORY_TEXT_LENGTH = 220;
 
 /** Set of message indices that already have images injected (prevents duplicate processing). */
 const processedMessages = new Set();
@@ -440,30 +441,49 @@ async function onMessageRendered(messageRef, attempt = 0) {
     }
 
     const messageText = message.mes || '';
-    if (!messageText) return;
 
     // Build regex from settings
     const regex = buildTriggerRegex(true);
-
     const matches = [...messageText.matchAll(regex)];
-    console.log(`[PixAI-DEBUG] onMessageRendered(${messageId}): matches=${matches.length}, autoGen=${settings.autoGenerate}, hasExtra=${!!message.extra?.pixai_image}, processed=${processedMessages.has(messageId)}`);
-    if (!matches.length) return;
+    const storedImages = getStoredImagesForMessage(message);
+    const hasExtra = storedImages.length > 0;
+    console.log(`[PixAI-DEBUG] onMessageRendered(${messageId}): matches=${matches.length}, autoGen=${settings.autoGenerate}, hasExtra=${hasExtra}, processed=${processedMessages.has(messageId)}`);
+    if (!matches.length && !hasExtra) return;
 
-    // Check if this message already has an image (from extra or already processed)
-    if (message.extra?.pixai_image) {
-        const mesEl = getMessageElement(messageId);
-        if (!mesEl.length || !mesEl.find('.mes_text').length) {
-            scheduleRenderRetry(messageId, attempt, 'image restore DOM not ready');
+    const mesEl = getMessageElement(messageId);
+    const mesBody = getMessageBody(mesEl);
+    if (!mesEl.length || !mesBody.length) {
+        console.log(`[PixAI-DEBUG] mesEl or .mes_text not ready for messageId=${messageId}, attempt=${attempt}`);
+        scheduleRenderRetry(messageId, attempt, 'message DOM not ready');
+        return;
+    }
+
+    if (matches.length) {
+        const inserted = showGenerateTrigger(mesEl, messageText, messageId);
+        if (!inserted && !hasExtra) {
+            scheduleRenderRetry(messageId, attempt, 'generate trigger insertion skipped');
             return;
         }
-        if (!mesEl.find('.pixai-image-container').length) {
-            const imgData = message.extra.pixai_image;
-            insertImageIntoMessage(mesEl, imgData.url, imgData.task_id, imgData.prompt, messageId);
+    }
+
+    // Keep generated and non-generated tags coexisting in one message.
+    if (hasExtra) {
+        for (const imgData of storedImages) {
+            insertImageIntoMessage(
+                mesEl,
+                imgData.url,
+                imgData.task_id || '',
+                imgData.prompt || '',
+                messageId,
+                { markerKey: imgData.marker_key || '' },
+            );
         }
-        const removed = removeTriggerMarkersFromMesBody(mesEl.find('.mes_text'));
-        if (removed > 0) {
-            console.log(`[PixAI-DEBUG] hasExtra cleanup removed markers=${removed} for messageId=${messageId}`);
-        }
+        processedMessages.add(messageId);
+        return;
+    }
+
+    if (!settings.autoGenerate) {
+        processedMessages.add(messageId);
         return;
     }
 
@@ -475,30 +495,15 @@ async function onMessageRendered(messageRef, attempt = 0) {
         return;
     }
 
-    const mesEl = getMessageElement(messageId);
-    if (!mesEl.length || !mesEl.find('.mes_text').length) {
-        console.log(`[PixAI-DEBUG] mesEl or .mes_text not ready for messageId=${messageId}, attempt=${attempt}`);
-        scheduleRenderRetry(messageId, attempt, 'message DOM not ready');
-        return;
-    }
-
     processedMessages.add(messageId);
 
-    if (settings.autoGenerate) {
-        await doGenerate(mesEl, prompt, messageId);
-    } else {
-        const inserted = showGenerateTrigger(mesEl, prompt, messageId);
-        if (!inserted) {
-            processedMessages.delete(messageId);
-            scheduleRenderRetry(messageId, attempt, 'generate trigger insertion skipped');
-        }
-    }
+    await doGenerate(mesEl, prompt, messageId, { markerKey: `${messageId}:0` });
 }
 
 /**
  * Show a clickable "Generate" button in the message.
  * @param {JQuery} mesEl - The .mes element
- * @param {string} prompt - Extracted prompt
+ * @param {string} messageText - Raw message text
  * @param {number} messageIndex
  */
 /**
@@ -567,116 +572,88 @@ function replaceTextNodeWithElement(root, regex, newEl, visibleOnly = false) {
     return true;
 }
 
-/**
- * Remove raw trigger marker text (e.g., image###...###) from a rendered message body.
- * Used when image is already available (hasExtra path) to avoid showing stale marker text.
- * @param {JQuery} mesBody
- * @returns {number} number of removed markers
- */
-function removeTriggerMarkersFromMesBody(mesBody) {
-    if (!mesBody?.length) return 0;
-
-    try {
-        const regex = buildTriggerRegex(true);
-        const htmlBefore = mesBody.html() || '';
-        let removed = 0;
-        const htmlAfter = htmlBefore.replace(regex, (fullMatch) => {
-            const hasPrompt = /image###([\s\S]+?)###/i.test(fullMatch);
-            if (hasPrompt) removed += 1;
-            return '';
-        });
-
-        if (removed > 0 && htmlAfter !== htmlBefore) {
-            mesBody.html(htmlAfter);
-        }
-        return removed;
-    } catch {
-        return 0;
-    }
-}
-
-function showGenerateTrigger(mesEl, prompt, messageIndex) {
-    const mesBody = mesEl.find('.mes_text');
+function showGenerateTrigger(mesEl, messageText, messageIndex) {
+    const mesBody = getMessageBody(mesEl);
     if (!mesBody.length) {
         console.log('[PixAI-DEBUG] showGenerateTrigger: mesBody not found');
         return false;
     }
 
-    console.log(`[PixAI-DEBUG] showGenerateTrigger called: messageIndex=${messageIndex}, prompt="${prompt.substring(0, 50)}..."`);
+    const triggerRegex = buildTriggerRegex(true);
+    const matches = [...String(messageText || '').matchAll(triggerRegex)];
+    if (!matches.length) return false;
+
+    const firstPrompt = extractPromptFromMatch(matches[0]) || '';
+    console.log(`[PixAI-DEBUG] showGenerateTrigger called: messageIndex=${messageIndex}, prompt="${firstPrompt.substring(0, 50)}..."`);
     console.log(`[PixAI-DEBUG] mesBody innerHTML (first 200): "${mesBody.html().substring(0, 200)}"`);
+    console.log(`[PixAI-DEBUG] triggerRegex: "${triggerRegex}"`);
 
-    const btn = $('<button>')
-        .addClass('pixai-generate-trigger')
-        .attr('data-prompt', prompt)
-        .attr('data-mesid', messageIndex)
-        .css({
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '6px',
-            margin: '8px 0',
-            padding: '8px 16px',
-            border: '1px solid #8b5cf6',
-            borderRadius: '6px',
-            background: 'linear-gradient(135deg, rgba(139,92,246,0.15), rgba(0,240,255,0.1))',
-            color: '#8b5cf6',
-            fontSize: '13px',
-            fontWeight: '500',
-            cursor: 'pointer',
-            visibility: 'visible',
-            opacity: '1',
-            width: 'auto',
-            height: 'auto',
-            overflow: 'visible',
-        })
-        .text('🎨 生成图片');
+    let insertedCount = 0;
+    for (let i = 0; i < matches.length; i++) {
+        const match = matches[i];
+        const prompt = extractPromptFromMatch(match);
+        if (!prompt) continue;
 
-    // Replace trigger text in DOM text nodes directly
-    let replaced = false;
-    try {
-        const tagRegex = buildTriggerRegex(false);
-        console.log(`[PixAI-DEBUG] triggerRegex: "${tagRegex}"`);
-        replaced = replaceTextNodeWithElement(mesBody[0], tagRegex, btn, true);
-        if (!replaced) {
-            replaced = replaceTextNodeWithElement(mesBody[0], tagRegex, btn, false);
-        }
-    } catch (e) {
-        console.error('[PixAI-DEBUG] regex error:', e);
-    }
+        const markerKey = `${messageIndex}:${i}`;
+        const hasMarkerAlready = mesBody
+            .find('.pixai-generate-trigger, .pixai-image-container')
+            .filter((_, el) => $(el).attr('data-marker-key') === markerKey)
+            .length > 0;
+        if (hasMarkerAlready) continue;
 
-    console.log(`[PixAI-DEBUG] replaced=${replaced}`);
-    if (!replaced) {
-        console.log('[PixAI-DEBUG] fallback: appending btn to mesBody');
-        mesBody.append(btn);
-    } else {
-        const visibleCountNow = mesBody.find('.pixai-generate-trigger:visible').length;
-        if (!visibleCountNow) {
-            console.log('[PixAI-DEBUG] replaced into non-visible node, append visible fallback');
-            mesBody.append(btn.clone(true, true));
-        }
-    }
+        const btn = $('<button>')
+            .addClass('pixai-generate-trigger')
+            .attr('data-prompt', prompt)
+            .attr('data-mesid', messageIndex)
+            .attr('data-marker-key', markerKey)
+            .css({
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                margin: '8px 0',
+                padding: '8px 16px',
+                border: '1px solid #8b5cf6',
+                borderRadius: '6px',
+                background: 'linear-gradient(135deg, rgba(139,92,246,0.15), rgba(0,240,255,0.1))',
+                color: '#8b5cf6',
+                fontSize: '13px',
+                fontWeight: '500',
+                cursor: 'pointer',
+                visibility: 'visible',
+                opacity: '1',
+                width: 'auto',
+                height: 'auto',
+                overflow: 'visible',
+            })
+            .text('🎨 生成图片');
 
-    // Final pass: replace remaining marker tags so messages with multiple tags all become buttons.
-    try {
-        const htmlRegex = buildTriggerRegex(true);
-        const htmlBefore = mesBody.html() || '';
-        let replacedCount = 0;
-        const htmlAfter = htmlBefore.replace(htmlRegex, (fullMatch, capture1) => {
-            let p = String(capture1 || '').trim();
-            if (!p) {
-                const fallback = /image###([\s\S]+?)###/i.exec(fullMatch);
-                p = fallback?.[1]?.trim() || '';
+        let replaced = false;
+        const fullTag = String(match[0] || '');
+        if (fullTag) {
+            const exactTagRegex = new RegExp(escapeRegex(fullTag), 's');
+            replaced = replaceTextNodeWithElement(mesBody[0], exactTagRegex, btn, true);
+            if (!replaced) {
+                replaced = replaceTextNodeWithElement(mesBody[0], exactTagRegex, btn, false);
             }
-            if (!p) return fullMatch;
-            replacedCount += 1;
-            return `<button class="pixai-generate-trigger" data-prompt="${escapeAttr(p)}" data-mesid="${messageIndex}">生成图片</button>`;
-        });
-        if (replacedCount > 0 && htmlAfter !== htmlBefore) {
-            mesBody.html(htmlAfter);
-            console.log(`[PixAI-DEBUG] html final-pass replaced=${replacedCount}`);
         }
-    } catch (e) {
-        console.error('[PixAI-DEBUG] html final-pass regex error:', e);
+
+        if (!replaced) {
+            const genericRegex = buildTriggerRegex(false);
+            replaced = replaceTextNodeWithElement(mesBody[0], genericRegex, btn, true);
+            if (!replaced) {
+                replaced = replaceTextNodeWithElement(mesBody[0], genericRegex, btn, false);
+            }
+        }
+
+        if (!replaced) {
+            console.log(`[PixAI-DEBUG] fallback: appending btn to mesBody (marker=${markerKey})`);
+            mesBody.append(btn);
+        }
+
+        insertedCount++;
     }
+
+    console.log(`[PixAI-DEBUG] html final-pass replaced=${insertedCount}`);
 
     // Verify button exists in DOM after insertion
     setTimeout(() => {
@@ -697,12 +674,17 @@ function showGenerateTrigger(mesEl, prompt, messageIndex) {
  * @param {string} prompt
  * @param {number} messageIndex
  */
-async function doGenerate(mesEl, prompt, messageIndex) {
-    const mesBody = mesEl.find('.mes_text');
+async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
+    const mesBody = getMessageBody(mesEl);
 
     // Show loading spinner
     const loadingEl = $(buildLoadingHtml());
-    mesBody.append(loadingEl);
+    const triggerBtn = options.triggerButton ? $(options.triggerButton) : $();
+    if (triggerBtn.length) {
+        triggerBtn.after(loadingEl);
+    } else {
+        mesBody.append(loadingEl);
+    }
 
     try {
         const result = await generateImage(prompt, messageIndex);
@@ -718,8 +700,8 @@ async function doGenerate(mesEl, prompt, messageIndex) {
 
         if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
             const imageUrl = pollResult.image_urls[0];
-            insertImageIntoMessage(mesEl, imageUrl, result.task_id, prompt, messageIndex);
-            saveImageToExtra(messageIndex, imageUrl, result.task_id, prompt);
+            insertImageIntoMessage(mesEl, imageUrl, result.task_id, prompt, messageIndex, options);
+            saveImageToExtra(messageIndex, imageUrl, result.task_id, prompt, options.markerKey || '');
 
             if (typeof toastr !== 'undefined') {
                 toastr.success('图片生成完成');
@@ -754,19 +736,31 @@ async function doGenerate(mesEl, prompt, messageIndex) {
  * @param {string} prompt
  * @param {number} messageIndex
  */
-function insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, messageIndex) {
-    const mesBody = mesEl.find('.mes_text');
+function insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, messageIndex, options = {}) {
+    const mesBody = getMessageBody(mesEl);
     if (!mesBody.length) return;
+    const markerKey = String(options.markerKey || '');
 
-    // Always clean marker text when inserting/restoring images.
-    removeTriggerMarkersFromMesBody(mesBody);
+    // Marker-level idempotency for coexist mode.
+    if (markerKey) {
+        const existingByMarker = mesBody
+            .find('.pixai-image-container')
+            .filter((_, el) => $(el).attr('data-marker-key') === markerKey)
+            .first();
+        if (existingByMarker.length) {
+            existingByMarker.attr('data-task-id', taskId || '');
+            existingByMarker.attr('data-prompt', prompt || '');
+            existingByMarker.find('img').attr('src', imageUrl);
+            return;
+        }
+    }
 
     // Avoid duplicate containers for the same task
-    if (mesBody.find(`.pixai-image-container[data-task-id="${taskId}"]`).length) return;
+    if (taskId && mesBody.find(`.pixai-image-container[data-task-id="${taskId}"]`).length) return;
 
     // Build image container element
     const container = $(`
-        <div class="pixai-image-container" data-task-id="${escapeAttr(taskId)}" data-prompt="${escapeAttr(prompt)}" data-mesid="${messageIndex}">
+        <div class="pixai-image-container" data-task-id="${escapeAttr(taskId)}" data-prompt="${escapeAttr(prompt)}" data-mesid="${messageIndex}" data-marker-key="${escapeAttr(markerKey)}">
             <img src="${escapeAttr(imageUrl)}" alt="Generated image" loading="lazy" />
             <div class="pixai-image-actions">
                 <button class="pixai-btn pixai-btn-regen" title="重新生成">🔄</button>
@@ -776,14 +770,43 @@ function insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, messageIndex) {
     `);
     container.find('img').on('click', () => window.open(imageUrl, '_blank'));
 
-    // 1. Try replacing the generate button (placed by showGenerateTrigger)
-    const triggerBtn = mesBody.find(`.pixai-generate-trigger[data-mesid="${messageIndex}"]`);
-    if (triggerBtn.length) {
-        triggerBtn.replaceWith(container);
+    // 1) Prefer replacing the exact clicked trigger button.
+    const clickedBtn = options.triggerButton ? $(options.triggerButton) : $();
+    if (clickedBtn.length) {
+        clickedBtn.replaceWith(container);
         return;
     }
 
-    // 2. Try replacing trigger text in DOM text nodes
+    // 2) Marker-level replacement for coexist mode.
+    if (markerKey) {
+        const markerBtn = mesBody
+            .find('.pixai-generate-trigger')
+            .filter((_, el) => $(el).attr('data-marker-key') === markerKey)
+            .first();
+        if (markerBtn.length) {
+            markerBtn.replaceWith(container);
+            return;
+        }
+    }
+
+    // 3) Prompt-level fallback.
+    const promptBtn = mesBody
+        .find('.pixai-generate-trigger')
+        .filter((_, el) => String($(el).attr('data-prompt') || '').trim() === String(prompt || '').trim())
+        .first();
+    if (promptBtn.length) {
+        promptBtn.replaceWith(container);
+        return;
+    }
+
+    // 4) Legacy fallback: first trigger in this message.
+    const legacyTriggerBtn = mesBody.find(`.pixai-generate-trigger[data-mesid="${messageIndex}"]`).first();
+    if (legacyTriggerBtn.length) {
+        legacyTriggerBtn.replaceWith(container);
+        return;
+    }
+
+    // 5) Last fallback: replace raw trigger text in DOM text nodes.
     let replaced = false;
     try {
         const tagRegex = buildTriggerRegex(false);
@@ -793,7 +816,7 @@ function insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, messageIndex) {
         }
     } catch { /* ignore regex errors */ }
 
-    // 3. Fallback: append at end
+    // 6) Final fallback: append at end.
     if (!replaced) mesBody.append(container);
 }
 
@@ -804,17 +827,96 @@ function insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, messageIndex) {
  * @param {string} taskId
  * @param {string} prompt
  */
-function saveImageToExtra(messageIndex, imageUrl, taskId, prompt) {
+function saveImageToExtra(messageIndex, imageUrl, taskId, prompt, markerKey = '') {
     const context = getContext();
-    if (context.chat[messageIndex]) {
-        context.chat[messageIndex].extra = context.chat[messageIndex].extra || {};
-        context.chat[messageIndex].extra.pixai_image = {
-            url: imageUrl,
-            task_id: taskId,
-            prompt: prompt,
-        };
-        context.saveChat();
+    if (!context.chat?.[messageIndex]) return;
+
+    const message = context.chat[messageIndex];
+    message.extra = message.extra || {};
+    const key = String(markerKey || '');
+
+    /** @type {{url: string, task_id: string, prompt: string, marker_key?: string}} */
+    const imageData = {
+        url: imageUrl,
+        task_id: taskId,
+        prompt,
+        marker_key: key || undefined,
+    };
+
+    const images = Array.isArray(message.extra.pixai_images)
+        ? message.extra.pixai_images
+            .filter(it => it && typeof it === 'object' && it.url)
+        : [];
+
+    let replaced = false;
+    if (key) {
+        for (let i = 0; i < images.length; i++) {
+            if (String(images[i].marker_key || '') === key) {
+                images[i] = imageData;
+                replaced = true;
+                break;
+            }
+        }
     }
+
+    if (!replaced && prompt) {
+        for (let i = 0; i < images.length; i++) {
+            if (String(images[i].prompt || '') === String(prompt)) {
+                images[i] = imageData;
+                replaced = true;
+                break;
+            }
+        }
+    }
+
+    if (!replaced) images.push(imageData);
+
+    message.extra.pixai_images = images;
+    // Keep backward compatibility for old consumers.
+    message.extra.pixai_image = imageData;
+    context.saveChat();
+}
+
+/**
+ * Read all locally stored images from message.extra, compatible with old/new formats.
+ * @param {SillyTavern.ChatMessage} message
+ * @returns {Array<{url: string, task_id: string, prompt: string, marker_key?: string}>}
+ */
+function getStoredImagesForMessage(message) {
+    const extra = message?.extra || {};
+    /** @type {Array<{url: string, task_id: string, prompt: string, marker_key?: string}>} */
+    const out = [];
+
+    if (Array.isArray(extra.pixai_images)) {
+        for (const item of extra.pixai_images) {
+            if (!item?.url) continue;
+            out.push({
+                url: item.url,
+                task_id: item.task_id || '',
+                prompt: item.prompt || '',
+                marker_key: item.marker_key || undefined,
+            });
+        }
+    }
+
+    if (extra.pixai_image?.url) {
+        const old = extra.pixai_image;
+        const already = out.some(item =>
+            item.url === old.url
+            && String(item.task_id || '') === String(old.task_id || '')
+            && String(item.prompt || '') === String(old.prompt || ''),
+        );
+        if (!already) {
+            out.push({
+                url: old.url,
+                task_id: old.task_id || '',
+                prompt: old.prompt || '',
+                marker_key: old.marker_key || undefined,
+            });
+        }
+    }
+
+    return out;
 }
 
 /**
@@ -833,16 +935,34 @@ async function restoreImagesForChat(chatId) {
 
     for (let i = 0; i < chat.length; i++) {
         const message = chat[i];
-        if (message.extra?.pixai_image) {
-            // Has local data — inject visually
-            const mesEl = getMessageElement(i);
-            if (mesEl.length && !mesEl.find('.pixai-image-container').length) {
-                const imgData = message.extra.pixai_image;
-                insertImageIntoMessage(mesEl, imgData.url, imgData.task_id, imgData.prompt, i);
-                processedMessages.add(i);
+        const messageText = String(message?.mes || '');
+        const matches = [...messageText.matchAll(buildTriggerRegex(true))];
+        const storedImages = getStoredImagesForMessage(message);
+        if (!matches.length && !storedImages.length) continue;
+
+        const mesEl = getMessageElement(i);
+        const mesBody = getMessageBody(mesEl);
+        if (!mesEl.length || !mesBody.length) continue;
+
+        if (matches.length) {
+            showGenerateTrigger(mesEl, messageText, i);
+        }
+
+        if (storedImages.length) {
+            for (const imgData of storedImages) {
+                insertImageIntoMessage(
+                    mesEl,
+                    imgData.url,
+                    imgData.task_id || '',
+                    imgData.prompt || '',
+                    i,
+                    { markerKey: imgData.marker_key || '' },
+                );
             }
+            processedMessages.add(i);
         } else {
             messagesNeedingRestore.push(i);
+            processedMessages.add(i);
         }
     }
 
@@ -853,35 +973,51 @@ async function restoreImagesForChat(chatId) {
         const serverImages = await apiCall('GET', `/v1/chat-images?chat_id=${encodeURIComponent(chatId)}`);
         if (!Array.isArray(serverImages) || !serverImages.length) return;
 
-        // Build a map of message_index -> image data from server
-        /** @type {Map<number, {image_url: string, task_id: string, prompt: string}>} */
+        // Build a map of message_index -> image list from server
+        /** @type {Map<number, Array<{image_url: string, task_id?: string, prompt?: string, marker_key?: string, markerKey?: string}>>} */
         const serverMap = new Map();
         for (const img of serverImages) {
-            if (img.message_index != null && img.image_url) {
-                serverMap.set(img.message_index, img);
-            }
+            const idx = Number.parseInt(String(img.message_index), 10);
+            if (!Number.isInteger(idx) || !img.image_url) continue;
+            if (!serverMap.has(idx)) serverMap.set(idx, []);
+            serverMap.get(idx).push(img);
         }
 
         for (const msgIdx of messagesNeedingRestore) {
-            const serverImg = serverMap.get(msgIdx);
-            if (!serverImg) continue;
+            const serverImageList = serverMap.get(msgIdx);
+            if (!serverImageList?.length) continue;
 
             const mesEl = getMessageElement(msgIdx);
-            if (!mesEl.length) continue;
+            const mesBody = getMessageBody(mesEl);
+            if (!mesEl.length || !mesBody.length) continue;
 
-            const imageUrl = serverImg.image_url;
-            const taskId = serverImg.task_id || '';
-            const prompt = serverImg.prompt || '';
+            const messageText = String(chat[msgIdx]?.mes || '');
+            if (messageText) {
+                showGenerateTrigger(mesEl, messageText, msgIdx);
+            }
 
-            insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, msgIdx);
-            saveImageToExtra(msgIdx, imageUrl, taskId, prompt);
+            for (const serverImg of serverImageList) {
+                const imageUrl = serverImg.image_url;
+                const taskId = serverImg.task_id || '';
+                const prompt = serverImg.prompt || '';
+                const markerKey = serverImg.marker_key || serverImg.markerKey || '';
+
+                insertImageIntoMessage(
+                    mesEl,
+                    imageUrl,
+                    taskId,
+                    prompt,
+                    msgIdx,
+                    { markerKey },
+                );
+                saveImageToExtra(msgIdx, imageUrl, taskId, prompt, markerKey);
+            }
             processedMessages.add(msgIdx);
         }
     } catch (err) {
         console.warn('[PixAI] Failed to restore images from server:', err.message);
     }
 }
-
 // ============ Context Helpers ============
 
 /**
@@ -911,11 +1047,23 @@ function getMessageElement(messageIndex) {
     return $(`.mes[mesid="${messageIndex}"]`);
 }
 
+/**
+ * Resolve the message body element. Prefer visible `.mes_text` when duplicates exist.
+ * @param {JQuery} mesEl
+ * @returns {JQuery}
+ */
+function getMessageBody(mesEl) {
+    if (!mesEl?.length) return $();
+    const visible = mesEl.find('.mes_text:visible').first();
+    if (visible.length) return visible;
+    return mesEl.find('.mes_text').first();
+}
+
 // ============ Story Share ============
 
 /**
  * Collect story segments from the current chat conversation.
- * Each segment contains text content and optionally a PixAI-generated image.
+ * Only include image-related segments to avoid uploading full chat history.
  * @returns {Array<{text: string, image_url?: string, image_prompt?: string}>}
  */
 function collectStorySegments() {
@@ -923,26 +1071,32 @@ function collectStorySegments() {
     const chat = context.chat;
     if (!chat || chat.length === 0) return [];
 
+    const triggerRegex = buildTriggerRegex(true);
+
     /** @type {Array<{text: string, image_url?: string, image_prompt?: string}>} */
     const segments = [];
     for (let i = 0; i < chat.length; i++) {
         const msg = chat[i];
-        if (!msg.mes) continue;
+        const rawText = String(msg?.mes || '');
+        if (!rawText) continue;
 
-        /** @type {{text: string, image_url?: string, image_prompt?: string}} */
-        const seg = {
-            text: msg.mes.substring(0, 500), // Limit text length per segment
-        };
+        // Prefer new multi-image storage, fallback to legacy single-image field.
+        const storedImages = getStoredImagesForMessage(msg);
+        if (!storedImages.length) continue;
 
-        // Check for pixai image in this message
-        if (msg.extra?.pixai_image) {
-            seg.image_url = msg.extra.pixai_image.url;
-            seg.image_prompt = msg.extra.pixai_image.prompt || '';
-        }
+        const relatedText = rawText
+            .replace(triggerRegex, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .substring(0, MAX_STORY_TEXT_LENGTH);
 
-        // Only include segments that have meaningful content
-        if (seg.text.trim() || seg.image_url) {
-            segments.push(seg);
+        for (const img of storedImages) {
+            if (!img?.url) continue;
+            segments.push({
+                text: relatedText || (img.prompt || '').substring(0, MAX_STORY_TEXT_LENGTH),
+                image_url: img.url,
+                image_prompt: img.prompt || '',
+            });
         }
     }
     return segments;
@@ -965,7 +1119,7 @@ async function shareStory() {
     const segments = collectStorySegments();
     if (segments.length === 0) {
         if (typeof toastr !== 'undefined') {
-            toastr.warning('No content to share');
+            toastr.warning('当前聊天没有已生成图片内容可分享');
         }
         return;
     }
@@ -1103,6 +1257,15 @@ function escapeHtml(str) {
  */
 function escapeAttr(str) {
     return (str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/**
+ * Escape literal text for use in RegExp source.
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeRegex(str) {
+    return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -1468,6 +1631,7 @@ jQuery(async () => {
 
         const prompt = String($btn.attr('data-prompt') || '').trim();
         const messageIndex = Number.parseInt($btn.attr('data-mesid') || '', 10);
+        const markerKey = String($btn.attr('data-marker-key') || '');
         if (!prompt || !Number.isInteger(messageIndex)) return;
 
         const mesEl = getMessageElement(messageIndex);
@@ -1476,11 +1640,10 @@ jQuery(async () => {
         $btn.data('pixaiBusy', true);
         $btn.prop('disabled', true).text('⏳ 生成中...');
         try {
-            await doGenerate(mesEl, prompt, messageIndex);
-            $btn.remove();
+            await doGenerate(mesEl, prompt, messageIndex, { triggerButton: $btn, markerKey });
         } catch (err) {
             $btn.prop('disabled', false).text('🎨 重试生成');
-            const mesBody = mesEl.find('.mes_text');
+            const mesBody = getMessageBody(mesEl);
             showError(mesBody, err.message);
         } finally {
             $btn.data('pixaiBusy', false);
@@ -1494,6 +1657,7 @@ jQuery(async () => {
         const container = $(this).closest('.pixai-image-container');
         const prompt = container.data('prompt');
         const messageIndex = parseInt(container.data('mesid'));
+        const markerKey = String(container.attr('data-marker-key') || '');
 
         // Per-message mutex: prevent concurrent regen/variant
         if (inFlightByMessage.has(messageIndex)) return;
@@ -1509,8 +1673,8 @@ jQuery(async () => {
             if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
                 const newUrl = pollResult.image_urls[0];
                 container.find('img').attr('src', newUrl);
-                container.data('task-id', result.task_id);
-                saveImageToExtra(messageIndex, newUrl, result.task_id, prompt);
+                container.attr('data-task-id', result.task_id);
+                saveImageToExtra(messageIndex, newUrl, result.task_id, prompt, markerKey);
                 if (typeof toastr !== 'undefined') {
                     toastr.success('重新生成完成');
                 }
@@ -1532,6 +1696,7 @@ jQuery(async () => {
         const container = $(this).closest('.pixai-image-container');
         const prompt = container.data('prompt');
         const messageIndex = parseInt(container.data('mesid'));
+        const markerKey = String(container.attr('data-marker-key') || '');
 
         // Per-message mutex: prevent concurrent regen/variant
         if (inFlightByMessage.has(messageIndex)) return;
@@ -1547,8 +1712,8 @@ jQuery(async () => {
             if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
                 const newUrl = pollResult.image_urls[0];
                 container.find('img').attr('src', newUrl);
-                container.data('task-id', result.task_id);
-                saveImageToExtra(messageIndex, newUrl, result.task_id, prompt);
+                container.attr('data-task-id', result.task_id);
+                saveImageToExtra(messageIndex, newUrl, result.task_id, prompt, markerKey);
                 if (typeof toastr !== 'undefined') {
                     toastr.success('变体生成完成');
                 }
