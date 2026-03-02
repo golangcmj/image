@@ -1321,6 +1321,63 @@ function resetProcessedState() {
     processedMessages.clear();
 }
 
+/**
+ * Ensure a standalone mobile entry button exists for opening the HUD.
+ * This is an inline-style fallback in case theme CSS hides the default HUD badge.
+ * @param {HUDManager|null} hudInstance
+ */
+function ensureMobileHudEntryButton(hudInstance) {
+    const isTouchLike = window.matchMedia('(hover: none), (pointer: coarse)').matches || window.innerWidth <= 900;
+    const id = 'pixai-mobile-hud-entry';
+    const existing = $(`#${id}`);
+
+    if (!isTouchLike) {
+        existing.remove();
+        return;
+    }
+
+    /** @type {JQuery} */
+    let btn = existing;
+    if (!btn.length) {
+        btn = $(`<button id="${id}" type="button" aria-label="打开生图面板">生图面板</button>`);
+        $('body').append(btn);
+        btn.on('click', () => {
+            if (!hudInstance || !hudInstance.el?.length) {
+                if (typeof toastr !== 'undefined') {
+                    toastr.warning('生图面板未初始化，请刷新页面');
+                }
+                return;
+            }
+            hudInstance.toggle();
+        });
+    }
+
+    btn.css({
+        position: 'fixed',
+        right: 'calc(env(safe-area-inset-right, 0px) + 12px)',
+        bottom: 'calc(env(safe-area-inset-bottom, 0px) + 128px)',
+        zIndex: '2147483640',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minWidth: '104px',
+        height: '40px',
+        padding: '0 12px',
+        borderRadius: '999px',
+        border: '1px solid #00f0ff',
+        background: 'rgba(10, 10, 26, 0.92)',
+        color: '#e0e0f0',
+        fontSize: '13px',
+        fontWeight: '600',
+        letterSpacing: '0.2px',
+        boxShadow: '0 0 14px rgba(0, 240, 255, 0.35)',
+        backdropFilter: 'blur(8px)',
+        opacity: '1',
+        visibility: 'visible',
+        pointerEvents: 'auto',
+    });
+}
+
 // ============ HUD Panel ============
 
 /**
@@ -1405,14 +1462,18 @@ class HUDManager {
     expand() {
         if (!this.el) return;
         this.el.removeClass('pixai-hud-collapsed').addClass('pixai-hud-expanded');
+        this.el.css({ display: 'block', visibility: 'visible', opacity: '1' });
         this.expanded = true;
+        $('#pixai-mobile-hud-entry').hide();
     }
 
     /** Collapse to badge (hides panel). */
     collapse() {
         if (!this.el) return;
         this.el.removeClass('pixai-hud-expanded').addClass('pixai-hud-collapsed');
+        this.el.css({ display: 'block', visibility: 'visible', opacity: '1' });
         this.expanded = false;
+        $('#pixai-mobile-hud-entry').show();
     }
 
     /**
@@ -1577,6 +1638,8 @@ jQuery(async () => {
     // ---- Initialize HUD ----
     hud = new HUDManager();
     console.log('[PixAI] HUD panel initialized');
+    ensureMobileHudEntryButton(hud);
+    $(window).on('resize orientationchange', () => ensureMobileHudEntryButton(hud));
 
     // ---- Bind UI elements to settings ----
 
