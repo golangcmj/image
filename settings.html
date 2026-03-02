@@ -1,0 +1,91 @@
+<div class="pixai-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b class="pixai-header">✦ 绘图酒馆</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+
+            <!-- Master Toggle -->
+            <div class="pixai-row">
+                <input id="pixai_enabled" type="checkbox" checked />
+                <label for="pixai_enabled" class="checkbox-label">启用插件</label>
+            </div>
+
+            <hr class="sysHR" />
+
+            <!-- Server Connection -->
+            <div class="pixai-section">
+                <h4 class="pixai-section-title">🔗 服务器连接</h4>
+                <label for="pixai_server_url">地址</label>
+                <input id="pixai_server_url" type="text" class="text_pole wide100p"
+                       placeholder="http://localhost:9090" />
+                <label for="pixai_api_key">API Key</label>
+                <div class="pixai-row">
+                    <input id="pixai_api_key" type="password" class="text_pole" style="flex:1"
+                           placeholder="sk-xxxxxxxxxxxx" />
+                </div>
+                <div class="pixai-row" style="margin-top:4px">
+                    <input id="pixai_validate_btn" type="button" class="menu_button menu_button_icon" value="验证" />
+                    <span id="pixai_status" class="pixai-status pixai-status-disconnected">未连接</span>
+                </div>
+            </div>
+
+            <hr class="sysHR" />
+
+            <!-- Preset Selector -->
+            <div class="pixai-section">
+                <h4 class="pixai-section-title">🎨 生成预设</h4>
+                <div class="pixai-row">
+                    <select id="pixai_preset_select" class="text_pole" style="flex:1">
+                        <option value="">-- 请先验证连接 --</option>
+                    </select>
+                    <button id="pixai_preset_refresh" type="button" class="menu_button menu_button_icon" title="刷新">🔄</button>
+                </div>
+            </div>
+
+            <hr class="sysHR" />
+
+            <!-- Global Prompts -->
+            <div class="pixai-section">
+                <h4 class="pixai-section-title">💬 全局提示词</h4>
+                <label for="pixai_global_positive">正向提示词 <span class="pixai-tag">追加</span></label>
+                <textarea id="pixai_global_positive" class="text_pole wide100p" rows="2"
+                          placeholder="自动追加到每次生成请求的提示词前面"></textarea>
+                <label for="pixai_global_negative">负向提示词 <span class="pixai-tag">覆盖</span></label>
+                <textarea id="pixai_global_negative" class="text_pole wide100p" rows="2"
+                          placeholder="若填写则覆盖预设中的负向提示词"></textarea>
+            </div>
+
+            <hr class="sysHR" />
+
+            <!-- Auto Generate -->
+            <div class="pixai-section">
+                <h4 class="pixai-section-title">⚡ 自动生成</h4>
+                <div class="pixai-row">
+                    <input id="pixai_auto_generate" type="checkbox" />
+                    <label for="pixai_auto_generate" class="checkbox-label">检测到标记时自动生图</label>
+                </div>
+                <label for="pixai_trigger_regex">触发正则</label>
+                <input id="pixai_trigger_regex" type="text" class="text_pole wide100p"
+                       value="image###(.+?)###" />
+                <div class="pixai-hint">示例: <code>image###美丽的女孩,动漫风格###</code></div>
+            </div>
+
+            <hr class="sysHR" />
+
+            <!-- Story Share -->
+            <div class="pixai-section">
+                <h4 class="pixai-section-title">📖 故事分享</h4>
+                <label for="pixai_story_title">标题 <span class="pixai-hint-inline">留空自动生成</span></label>
+                <input id="pixai_story_title" type="text" class="text_pole wide100p"
+                       placeholder="角色名 + 日期" />
+                <button id="pixai_share_btn" class="menu_button" style="width:100%;margin-top:4px">
+                    📤 分享当前对话为故事
+                </button>
+                <div id="pixai_share_status" style="margin-top:4px;display:none"></div>
+            </div>
+
+        </div>
+    </div>
+</div>
