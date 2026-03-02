@@ -1346,7 +1346,9 @@ class HUDManager {
     _createDOM() {
         const hudHtml = `
             <div id="pixai-hud" class="pixai-hud pixai-hud-collapsed">
-                <div class="pixai-hud-badge" title="绘图酒馆 Status">
+                <div class="pixai-hud-badge" title="PixAI HUD">
+                    <span class="pixai-hud-badge-icon">AI</span>
+                    <span class="pixai-hud-badge-label">生图</span>
                     <span class="pixai-hud-balance">--</span>
                     <span class="pixai-hud-ring"></span>
                 </div>
