@@ -7,7 +7,7 @@ import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'pixai_tavern';
 const extensionFolderPath = new URL('.', import.meta.url).pathname.replace(/^\//, '').replace(/\/$/, '');
-const LOCAL_VERSION = '1.1.0';
+const LOCAL_VERSION = '1.2.0';
 const UPDATE_CHECK_URL = 'https://raw.githubusercontent.com/golangcmj/image/main/manifest.json';
 
 /** @returns {SillyTavern.Context} */
@@ -1787,6 +1787,152 @@ async function checkForUpdate() {
     }
 }
 
+// ============ Streaming Real-time Replacement ============
+
+/** Selector matching all PixAI-injected DOM elements. */
+const PIXAI_INJECTED_SELECTOR = '.pixai-generate-trigger, .pixai-image-container, .pixai-loading-spinner, .pixai-error';
+
+/** Singleton observer reference — prevents duplicate observers on hot reload. */
+/** @type {MutationObserver|null} */
+let streamingObserver = null;
+
+/**
+ * Check whether a MutationRecord was caused by our own DOM changes.
+ * - characterData: true if the text node lives inside a pixai element.
+ * - childList: true if any addedNode/removedNode IS or CONTAINS a pixai element.
+ *   (childList target is the *parent*, e.g. `.mes_text`, not the injected node.)
+ * @param {MutationRecord} mutation
+ * @returns {boolean}
+ */
+function isSelfMutation(mutation) {
+    if (mutation.type === 'characterData') {
+        const parent = mutation.target.parentElement;
+        return !!parent?.closest(PIXAI_INJECTED_SELECTOR);
+    }
+
+    // childList — check added/removed nodes, not target
+    /** @param {Node} node */
+    const isPixai = (node) => {
+        if (!(node instanceof Element)) return false;
+        return node.matches(PIXAI_INJECTED_SELECTOR)
+            || !!node.closest(PIXAI_INJECTED_SELECTOR)
+            || !!node.querySelector(PIXAI_INJECTED_SELECTOR);
+    };
+
+    for (const node of mutation.addedNodes) {
+        if (isPixai(node)) return true;
+    }
+    for (const node of mutation.removedNodes) {
+        if (isPixai(node)) return true;
+    }
+    return false;
+}
+
+/**
+ * Set up a MutationObserver on #chat to detect and replace complete
+ * `image### xxx ###` patterns in real-time during streaming output.
+ * Also catches message edit re-renders for immediate button/image restoration.
+ */
+function setupStreamingObserver() {
+    const chatContainer = document.getElementById('chat');
+    if (!chatContainer) {
+        setTimeout(setupStreamingObserver, 1000);
+        return;
+    }
+
+    // Singleton: disconnect previous observer on hot reload
+    if (streamingObserver) {
+        streamingObserver.disconnect();
+        streamingObserver = null;
+    }
+
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    let debounceTimer = null;
+    /** @type {Set<string>} */
+    const dirtyMesIds = new Set();
+
+    streamingObserver = new MutationObserver((mutations) => {
+        if (!getSettings().enabled) return;
+
+        for (const mutation of mutations) {
+            // Fix #1: properly filter self-mutations for both childList and characterData
+            if (isSelfMutation(mutation)) continue;
+
+            const node = mutation.target;
+            const el = node instanceof Element ? node : node.parentElement;
+            if (!el) continue;
+
+            const mesEl = el.closest('.mes');
+            if (!mesEl) continue;
+            const mesId = mesEl.getAttribute('mesid');
+            if (mesId != null) dirtyMesIds.add(mesId);
+        }
+
+        if (!dirtyMesIds.size) return;
+
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            const ids = [...dirtyMesIds];
+            dirtyMesIds.clear();
+            for (const id of ids) {
+                handleStreamingReplacement(parseInt(id, 10));
+            }
+        }, 80);
+    });
+
+    streamingObserver.observe(chatContainer, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+    });
+
+    console.log('[PixAI] Streaming observer initialized');
+}
+
+/**
+ * Process a single message for real-time trigger replacement during streaming.
+ * Called by the MutationObserver when DOM changes are detected in a message.
+ * Handles both streaming and message edit re-render scenarios.
+ * @param {number} messageIndex
+ */
+function handleStreamingReplacement(messageIndex) {
+    if (!Number.isInteger(messageIndex) || messageIndex < 0) return;
+
+    const $mesEl = getMessageElement(messageIndex);
+    if (!$mesEl.length) return;
+
+    const mesBody = getMessageBody($mesEl);
+    if (!mesBody.length) return;
+
+    const context = getContext();
+    const message = context.chat?.[messageIndex];
+    const messageText = message?.mes || mesBody.text() || '';
+
+    // Check two independent conditions
+    const hasTrigger = buildTriggerRegex(false).test(messageText);
+    const storedImages = message ? getStoredImagesForMessage(message) : [];
+
+    // Fix #2: early exit only if NEITHER trigger patterns NOR stored images exist
+    if (!hasTrigger && !storedImages.length) return;
+
+    // Replace raw trigger text with generate buttons (showGenerateTrigger has internal dedup)
+    if (hasTrigger) {
+        showGenerateTrigger($mesEl, messageText, messageIndex);
+    }
+
+    // Restore previously stored images (independent of trigger presence)
+    for (const imgData of storedImages) {
+        insertImageIntoMessage(
+            $mesEl,
+            imgData.url,
+            imgData.task_id || '',
+            imgData.prompt || '',
+            messageIndex,
+            { markerKey: imgData.marker_key || '' },
+        );
+    }
+}
+
 // ============ Initialization ============
 
 jQuery(async () => {
@@ -2124,6 +2270,9 @@ jQuery(async () => {
             }, 300);
         }
     });
+
+    // ---- Streaming Observer ----
+    setupStreamingObserver();
 
     // ---- Auto-Validate on Load ----
 
