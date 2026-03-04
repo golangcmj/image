@@ -7,6 +7,8 @@ import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'pixai_tavern';
 const extensionFolderPath = new URL('.', import.meta.url).pathname.replace(/^\//, '').replace(/\/$/, '');
+const LOCAL_VERSION = '1.1.0';
+const UPDATE_CHECK_URL = 'https://raw.githubusercontent.com/golangcmj/image/main/manifest.json';
 
 /** @returns {SillyTavern.Context} */
 const getContext = () => SillyTavern.getContext();
@@ -1741,6 +1743,50 @@ async function fetchPresetCost(preset) {
     }
 }
 
+// ============ Update Check ============
+
+/**
+ * Compare two semver strings (e.g. "1.0.0" vs "1.1.0").
+ * @returns {number} positive if a > b, negative if a < b, 0 if equal
+ */
+function compareSemver(a, b) {
+    const pa = String(a || '0').split('.').map(Number);
+    const pb = String(b || '0').split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const diff = (pa[i] || 0) - (pb[i] || 0);
+        if (diff !== 0) return diff;
+    }
+    return 0;
+}
+
+/**
+ * Check GitHub for a newer version and show a NEW badge if available.
+ */
+async function checkForUpdate() {
+    try {
+        const resp = await fetch(UPDATE_CHECK_URL, { cache: 'no-store' });
+        if (!resp.ok) return;
+        const remote = await resp.json();
+        const remoteVersion = remote?.version;
+        if (!remoteVersion || compareSemver(remoteVersion, LOCAL_VERSION) <= 0) return;
+
+        // Show NEW badge next to the header
+        const header = $('.pixai-header');
+        if (header.length && !header.find('.pixai-update-badge').length) {
+            header.append(
+                `<span class="pixai-update-badge" title="有新版本 v${remoteVersion} 可用" ` +
+                `style="margin-left:6px;padding:1px 6px;font-size:10px;font-weight:700;` +
+                `border-radius:4px;background:linear-gradient(135deg,#ff00aa,#8b5cf6);` +
+                `color:#fff;vertical-align:middle;cursor:default;animation:neonPulse 2s ease-in-out infinite">` +
+                `NEW</span>`,
+            );
+        }
+        console.log(`[PixAI] Update available: v${LOCAL_VERSION} → v${remoteVersion}`);
+    } catch {
+        // Non-critical: silently ignore update check failures
+    }
+}
+
 // ============ Initialization ============
 
 jQuery(async () => {
@@ -2095,6 +2141,9 @@ jQuery(async () => {
             console.warn('[PixAI] Auto-validate failed:', err);
         }
     }
+
+    // ---- Check for updates ----
+    checkForUpdate();
 
     console.log('[PixAI] 绘图酒馆 extension loaded successfully');
 });
