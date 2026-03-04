@@ -39,6 +39,13 @@ let presetsCache = [];
 /** Per-message in-flight lock to prevent concurrent regen/variant. */
 const inFlightByMessage = new Set();
 
+/**
+ * Per-marker generation state — survives DOM re-renders during streaming.
+ * Keys are scoped to chat: `${chatId}:${markerKey}` to prevent cross-chat interference.
+ * @type {Map<string, {prompt: string, messageIndex: number}>}
+ */
+const inFlightMarkers = new Map();
+
 /** Global HUD instance (created on jQuery ready). */
 /** @type {HUDManager|null} */
 let hud = null;
@@ -738,6 +745,10 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
             continue;
         }
 
+        // Check if this marker is currently in-flight (generation in progress)
+        const chatScopedKey = `${getCurrentChatId()}:${markerKey}`;
+        const isInFlight = inFlightMarkers.has(chatScopedKey);
+
         const btn = $('<button>')
             .addClass('pixai-generate-trigger')
             .attr('data-prompt', prompt)
@@ -755,14 +766,19 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
                 color: '#8b5cf6',
                 fontSize: '13px',
                 fontWeight: '500',
-                cursor: 'pointer',
+                cursor: isInFlight ? 'not-allowed' : 'pointer',
                 visibility: 'visible',
-                opacity: '1',
+                opacity: isInFlight ? '0.6' : '1',
                 width: 'auto',
                 height: 'auto',
                 overflow: 'visible',
             })
-            .text('🎨 生成图片');
+            .text(isInFlight ? '⏳ 生成中...' : '🎨 生成图片')
+            .prop('disabled', isInFlight);
+
+        if (isInFlight) {
+            btn.data('pixaiBusy', true);
+        }
 
         let replaced = false;
         const fullTag = String(match[0] || '');
@@ -801,6 +817,13 @@ async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
     const originChatId = getCurrentChatId();
     const mesBody = getMessageBody(mesEl);
     const triggerBtn = options.triggerButton ? $(options.triggerButton) : $();
+    const markerKey = options.markerKey || '';
+    const chatScopedKey = markerKey ? `${originChatId}:${markerKey}` : '';
+
+    // Track in-flight state so re-created buttons survive streaming re-renders
+    if (chatScopedKey) {
+        inFlightMarkers.set(chatScopedKey, { prompt, messageIndex });
+    }
 
     // Show loading spinner next to the trigger button
     const loadingEl = $(buildLoadingHtml());
@@ -810,11 +833,26 @@ async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
         mesBody.append(loadingEl);
     }
 
-    /** Reset the trigger button to clickable state. */
-    const resetButton = () => {
-        if (triggerBtn.length) {
-            triggerBtn.prop('disabled', false).text('🎨 重试生成');
-            triggerBtn.data('pixaiBusy', false);
+    /**
+     * Clear in-flight tracking and reset any live button in the DOM.
+     * Works even if the original triggerBtn was destroyed by ST re-render,
+     * because we find the current button by markerKey in the live DOM.
+     */
+    const clearInFlightState = () => {
+        if (chatScopedKey) inFlightMarkers.delete(chatScopedKey);
+
+        // Find the current button in live DOM (may differ from original triggerBtn)
+        if (markerKey) {
+            const liveMesEl = getMessageElement(messageIndex);
+            const liveBtn = liveMesEl
+                .find(`.pixai-generate-trigger[data-marker-key="${markerKey}"]`)
+                .first();
+            if (liveBtn.length) {
+                liveBtn.prop('disabled', false)
+                    .text('🎨 重试生成')
+                    .data('pixaiBusy', false)
+                    .css({ cursor: 'pointer', opacity: '1' });
+            }
         }
     };
 
@@ -833,7 +871,9 @@ async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
 
         if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
             const imageUrl = pollResult.image_urls[0];
-            const markerKey = options.markerKey || '';
+
+            // Clear in-flight state — image is ready
+            if (chatScopedKey) inFlightMarkers.delete(chatScopedKey);
 
             // Check chat context BEFORE any persistence or DOM work
             const currentChatId = getCurrentChatId();
@@ -860,7 +900,7 @@ async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
             }
         } else {
             removePendingTask(taskId);
-            resetButton();
+            clearInFlightState();
             showError(mesBody, '生成完成但未返回图片', triggerBtn.length ? triggerBtn : loadingEl);
         }
 
@@ -877,7 +917,7 @@ async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
         if (taskId && err instanceof TerminalGenerationError) {
             removePendingTask(taskId);
         }
-        resetButton();
+        clearInFlightState();
         showError(mesBody, err.message, triggerBtn);
         console.error('[PixAI] Generation failed:', err);
     }
