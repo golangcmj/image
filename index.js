@@ -1819,10 +1819,9 @@ function isSelfMutation(mutation) {
             || !!node.querySelector(PIXAI_INJECTED_SELECTOR);
     };
 
+    // Only check addedNodes — removedNodes containing pixai elements is normal
+    // during external re-renders (ST redraws .mes_text, old pixai nodes get removed).
     for (const node of mutation.addedNodes) {
-        if (isPixai(node)) return true;
-    }
-    for (const node of mutation.removedNodes) {
         if (isPixai(node)) return true;
     }
     return false;
