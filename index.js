@@ -17,13 +17,13 @@ const defaultSettings = {
     selectedPresetId: null,
     globalPositivePrompt: '',
     globalNegativePrompt: '',
-    autoGenerate: false,
     triggerRegex: 'image###(.+?)###',
     enabled: true,
 };
 
 const POLL_INTERVAL_MS = 3000;
 const MAX_POLL_ATTEMPTS = 100; // ~5 minutes at 3s interval
+const POLL_FETCH_RETRIES = 3;    // retries per single poll fetch on network error
 const RENDER_RETRY_DELAY_MS = 250;
 const MAX_RENDER_RETRIES = 8;
 const MAX_STORY_TEXT_LENGTH = 220;
@@ -40,6 +40,130 @@ const inFlightByMessage = new Set();
 /** Global HUD instance (created on jQuery ready). */
 /** @type {HUDManager|null} */
 let hud = null;
+
+/** Structured error for terminal generation failures (task failed/cancelled/timeout/config). */
+class TerminalGenerationError extends Error {
+    /** @param {string} message */
+    constructor(message) {
+        super(message);
+        this.name = 'TerminalGenerationError';
+    }
+}
+
+/** Set of task IDs currently being recovered — prevents concurrent duplicate recovery. */
+const recoveringTaskIds = new Set();
+
+// ============ Pending Task Persistence ============
+
+/**
+ * @typedef {{task_id: string, chat_id: string, message_index: number, prompt: string, marker_key: string, started_at: number}} PendingTask
+ */
+
+/** Get the pending tasks array from extension settings. */
+function getPendingTasks() {
+    const settings = getSettings();
+    if (!Array.isArray(settings.pendingTasks)) {
+        settings.pendingTasks = [];
+    }
+    return settings.pendingTasks;
+}
+
+/** Save a task as pending so it can be recovered after page refresh. */
+function addPendingTask(taskId, chatId, messageIndex, prompt, markerKey) {
+    const pending = getPendingTasks();
+    pending.push({
+        task_id: taskId,
+        chat_id: chatId,
+        message_index: messageIndex,
+        prompt,
+        marker_key: markerKey || '',
+        started_at: Date.now(),
+    });
+    saveSettingsDebounced();
+}
+
+/** Remove a pending task after completion or failure. */
+function removePendingTask(taskId) {
+    const settings = getSettings();
+    const pending = getPendingTasks();
+    settings.pendingTasks = pending.filter(t => t.task_id !== taskId);
+    saveSettingsDebounced();
+}
+
+/**
+ * Resume polling for interrupted pending tasks (e.g. after page refresh).
+ * Called once during initialization.
+ */
+async function recoverPendingTasks() {
+    const pending = getPendingTasks();
+    if (!pending.length) return;
+
+    const currentChatId = getCurrentChatId();
+    console.log(`[PixAI] Recovering ${pending.length} pending task(s)...`);
+
+    // Snapshot and clear — each recovery re-adds on failure if needed
+    const tasksToRecover = [...pending];
+
+    for (const task of tasksToRecover) {
+        // Skip tasks older than 10 minutes — they're likely expired
+        if (Date.now() - task.started_at > 10 * 60 * 1000) {
+            removePendingTask(task.task_id);
+            console.warn(`[PixAI] Skipping expired pending task ${task.task_id}`);
+            continue;
+        }
+
+        // Deduplicate: skip if already being recovered (e.g. rapid manual validate clicks)
+        if (recoveringTaskIds.has(task.task_id)) continue;
+
+        // Resume polling in background (don't block initialization)
+        recoverSingleTask(task, currentChatId).catch(err => {
+            console.error(`[PixAI] Recovery failed for task ${task.task_id}:`, err);
+        });
+    }
+}
+
+/** Recover a single pending task: poll → save → optionally insert DOM. */
+async function recoverSingleTask(task, currentChatId) {
+    recoveringTaskIds.add(task.task_id);
+    if (hud) hud.addTask(task.task_id, task.prompt);
+
+    try {
+        const pollResult = await pollTask(task.task_id);
+
+        if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
+            const imageUrl = pollResult.image_urls[0];
+
+            // Only persist if we're in the correct chat to avoid cross-chat corruption
+            if (getCurrentChatId() === task.chat_id) {
+                saveImageToExtra(task.message_index, imageUrl, task.task_id, task.prompt, task.marker_key);
+                const mesEl = getMessageElement(task.message_index);
+                if (mesEl.length) {
+                    insertImageIntoMessage(mesEl, imageUrl, task.task_id, task.prompt, task.message_index, {
+                        markerKey: task.marker_key,
+                    });
+                }
+            }
+            // Terminal success — remove pending regardless of chat context
+            removePendingTask(task.task_id);
+
+            if (typeof toastr !== 'undefined') {
+                toastr.success('恢复的图片生成完成');
+            }
+        } else {
+            // Terminal: completed but no images — remove pending
+            removePendingTask(task.task_id);
+        }
+    } catch (err) {
+        if (err instanceof TerminalGenerationError) {
+            removePendingTask(task.task_id);
+        }
+        // Transient errors: keep pending for retry on next load
+        const label = err instanceof TerminalGenerationError ? 'terminal' : 'transient';
+        console.warn(`[PixAI] Recovery failed (${label}) for task ${task.task_id}:`, err.message);
+    } finally {
+        recoveringTaskIds.delete(task.task_id);
+    }
+}
 
 // ============ Settings Helpers ============
 
@@ -322,7 +446,7 @@ async function generateImage(prompt, messageIndex) {
     const settings = getSettings();
 
     if (!settings.selectedPresetId) {
-        throw new Error('请先选择生成预设');
+        throw new TerminalGenerationError('请先选择生成预设');
     }
 
     const finalPrompt = settings.globalPositivePrompt
@@ -355,7 +479,7 @@ async function generateVariant(prompt, messageIndex) {
     const settings = getSettings();
 
     if (!settings.selectedPresetId) {
-        throw new Error('请先选择生成预设');
+        throw new TerminalGenerationError('请先选择生成预设');
     }
 
     // Find the selected preset from loaded list
@@ -407,10 +531,25 @@ async function generateVariant(prompt, messageIndex) {
 async function pollTask(taskId) {
     for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
         await delay(POLL_INTERVAL_MS);
-        const data = await apiCall('GET', `/v1/tasks/${taskId}`);
+
+        // Retry individual fetch to survive transient network errors
+        let data;
+        for (let retry = 0; retry <= POLL_FETCH_RETRIES; retry++) {
+            try {
+                data = await apiCall('GET', `/v1/tasks/${taskId}`);
+                break;
+            } catch (fetchErr) {
+                if (retry >= POLL_FETCH_RETRIES) {
+                    console.error(`[PixAI] Poll fetch failed after ${POLL_FETCH_RETRIES + 1} attempts:`, fetchErr);
+                    if (hud) hud.updateTask(taskId, 'failed');
+                    throw fetchErr;
+                }
+                console.warn(`[PixAI] Poll fetch retry ${retry + 1}/${POLL_FETCH_RETRIES}:`, fetchErr.message);
+                await delay(1000 * (retry + 1)); // backoff: 1s, 2s, 3s
+            }
+        }
 
         if (data.status === 'completed') {
-            // Update HUD: mark completed with first image URL
             if (hud) {
                 const firstUrl = data.image_urls?.[0] || null;
                 hud.updateTask(taskId, 'completed', firstUrl);
@@ -418,24 +557,15 @@ async function pollTask(taskId) {
             return data;
         }
         if (data.status === 'failed' || data.status === 'cancelled') {
-            // Update HUD: mark failed
-            if (hud) {
-                hud.updateTask(taskId, 'failed');
-            }
-            throw new Error(`生成任务${data.status === 'failed' ? '失败' : '已取消'}`);
+            if (hud) hud.updateTask(taskId, 'failed');
+            throw new TerminalGenerationError(`生成任务${data.status === 'failed' ? '失败' : '已取消'}`);
         }
 
-        // Still processing — update HUD to generating status
-        if (hud) {
-            hud.updateTask(taskId, 'generating');
-        }
+        if (hud) hud.updateTask(taskId, 'generating');
     }
 
-    // Timeout — mark as failed in HUD
-    if (hud) {
-        hud.updateTask(taskId, 'failed');
-    }
-    throw new Error('生成超时，请稍后重试');
+    if (hud) hud.updateTask(taskId, 'failed');
+    throw new TerminalGenerationError('生成超时，请稍后重试');
 }
 
 // ============ Message Processing ============
@@ -470,26 +600,24 @@ async function onMessageRendered(messageRef, attempt = 0) {
     const matches = [...messageText.matchAll(regex)];
     const storedImages = getStoredImagesForMessage(message);
     const hasExtra = storedImages.length > 0;
-    console.log(`[PixAI-DEBUG] onMessageRendered(${messageId}): matches=${matches.length}, autoGen=${settings.autoGenerate}, hasExtra=${hasExtra}, processed=${processedMessages.has(messageId)}`);
     if (!matches.length && !hasExtra) return;
 
     const mesEl = getMessageElement(messageId);
     const mesBody = getMessageBody(mesEl);
     if (!mesEl.length || !mesBody.length) {
-        console.log(`[PixAI-DEBUG] mesEl or .mes_text not ready for messageId=${messageId}, attempt=${attempt}`);
         scheduleRenderRetry(messageId, attempt, 'message DOM not ready');
         return;
     }
 
     if (matches.length) {
         const inserted = showGenerateTrigger(mesEl, messageText, messageId);
-        if (!inserted && !settings.autoGenerate) {
+        if (!inserted) {
             scheduleRenderRetry(messageId, attempt, 'generate trigger insertion skipped');
             return;
         }
     }
 
-    // Keep generated and non-generated tags coexisting in one message.
+    // Restore previously generated images into the message.
     if (hasExtra) {
         for (const imgData of storedImages) {
             insertImageIntoMessage(
@@ -501,13 +629,9 @@ async function onMessageRendered(messageRef, attempt = 0) {
                 { markerKey: imgData.marker_key || '' },
             );
         }
-        processedMessages.add(messageId);
-        return;
     }
 
-    // Auto-generate path is intentionally disabled: generation must be user-initiated via button click.
     processedMessages.add(messageId);
-    return;
 }
 
 /**
@@ -584,19 +708,11 @@ function replaceTextNodeWithElement(root, regex, newEl, visibleOnly = false) {
 
 function showGenerateTrigger(mesEl, messageText, messageIndex) {
     const mesBody = getMessageBody(mesEl);
-    if (!mesBody.length) {
-        console.log('[PixAI-DEBUG] showGenerateTrigger: mesBody not found');
-        return false;
-    }
+    if (!mesBody.length) return false;
 
     const triggerRegex = buildTriggerRegex(true);
     const matches = [...String(messageText || '').matchAll(triggerRegex)];
     if (!matches.length) return false;
-
-    const firstPrompt = extractPromptFromMatch(matches[0]) || '';
-    console.log(`[PixAI-DEBUG] showGenerateTrigger called: messageIndex=${messageIndex}, prompt="${firstPrompt.substring(0, 50)}..."`);
-    console.log(`[PixAI-DEBUG] mesBody innerHTML (first 200): "${mesBody.html().substring(0, 200)}"`);
-    console.log(`[PixAI-DEBUG] triggerRegex: "${triggerRegex}"`);
 
     let handledCount = 0;
     let insertedCount = 0;
@@ -667,22 +783,8 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
         if (replaced) {
             insertedCount++;
             handledCount++;
-        } else {
-            console.log(`[PixAI-DEBUG] skip unmatched marker without append (marker=${markerKey})`);
         }
     }
-
-    console.log(`[PixAI-DEBUG] html final-pass replaced=${insertedCount}, handled=${handledCount}, total=${matches.length}`);
-
-    // Verify button exists in DOM after insertion
-    setTimeout(() => {
-        const found = mesBody.find('.pixai-generate-trigger').length;
-        const visibleFound = mesBody.find('.pixai-generate-trigger:visible').length;
-        console.log(`[PixAI-DEBUG] verify: button total=${found}, visible=${visibleFound} after 100ms`);
-        if (!visibleFound) {
-            console.log(`[PixAI-DEBUG] mesBody HTML after: "${mesBody.html().substring(0, 300)}"`);
-        }
-    }, 100);
 
     return handledCount > 0;
 }
@@ -694,57 +796,87 @@ function showGenerateTrigger(mesEl, messageText, messageIndex) {
  * @param {number} messageIndex
  */
 async function doGenerate(mesEl, prompt, messageIndex, options = {}) {
-    if (!options.userInitiated && !getSettings().autoGenerate) {
-        throw new Error('自动生图已关闭，请点击按钮手动生成');
-    }
-
+    const originChatId = getCurrentChatId();
     const mesBody = getMessageBody(mesEl);
-
-    // Show loading spinner
-    const loadingEl = $(buildLoadingHtml());
     const triggerBtn = options.triggerButton ? $(options.triggerButton) : $();
+
+    // Show loading spinner next to the trigger button
+    const loadingEl = $(buildLoadingHtml());
     if (triggerBtn.length) {
         triggerBtn.after(loadingEl);
     } else {
         mesBody.append(loadingEl);
     }
 
+    /** Reset the trigger button to clickable state. */
+    const resetButton = () => {
+        if (triggerBtn.length) {
+            triggerBtn.prop('disabled', false).text('🎨 重试生成');
+            triggerBtn.data('pixaiBusy', false);
+        }
+    };
+
+    let taskId = null;
     try {
         const result = await generateImage(prompt, messageIndex);
+        taskId = result.task_id;
 
-        // Register task in HUD
-        if (hud) {
-            hud.addTask(result.task_id, prompt);
-        }
+        // Register task in HUD + persist for crash recovery
+        if (hud) hud.addTask(taskId, prompt);
+        addPendingTask(taskId, originChatId, messageIndex, prompt, options.markerKey || '');
 
-        const pollResult = await pollTask(result.task_id);
+        const pollResult = await pollTask(taskId);
 
         loadingEl.remove();
 
         if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
             const imageUrl = pollResult.image_urls[0];
-            insertImageIntoMessage(mesEl, imageUrl, result.task_id, prompt, messageIndex, options);
-            saveImageToExtra(messageIndex, imageUrl, result.task_id, prompt, options.markerKey || '');
+            const markerKey = options.markerKey || '';
 
-            if (typeof toastr !== 'undefined') {
-                toastr.success('图片生成完成');
+            // Check chat context BEFORE any persistence or DOM work
+            const currentChatId = getCurrentChatId();
+            if (currentChatId !== originChatId) {
+                // Wrong chat active — do NOT write to context.chat (would corrupt).
+                // Keep pending task alive so server-side /v1/chat-images can restore later.
+                console.warn('[PixAI] Chat changed during generation, skipping local save to avoid corruption');
+                if (typeof toastr !== 'undefined') {
+                    toastr.info('图片已生成，切回原聊天后刷新可查看');
+                }
+            } else {
+                // Same chat — safe to persist and insert DOM
+                removePendingTask(taskId);
+                saveImageToExtra(messageIndex, imageUrl, taskId, prompt, markerKey);
+                const freshMesEl = getMessageElement(messageIndex);
+                if (freshMesEl.length) {
+                    insertImageIntoMessage(freshMesEl, imageUrl, taskId, prompt, messageIndex, options);
+                } else {
+                    console.warn('[PixAI] Message DOM not found after poll, image saved for restore');
+                }
+                if (typeof toastr !== 'undefined') {
+                    toastr.success('图片生成完成');
+                }
             }
         } else {
-            showError(mesBody, '生成完成但未返回图片');
+            removePendingTask(taskId);
+            resetButton();
+            showError(mesBody, '生成完成但未返回图片', triggerBtn.length ? triggerBtn : loadingEl);
         }
 
         // Refresh balance in HUD after generation completes
         try {
             const refreshData = await apiCall('GET', '/v1/validate');
-            if (hud) {
-                hud.updateBalance(refreshData.points_remaining ?? -1);
-            }
+            if (hud) hud.updateBalance(refreshData.points_remaining ?? -1);
         } catch {
             // Non-critical: balance refresh failure is silently ignored
         }
     } catch (err) {
         loadingEl.remove();
-        showError(mesBody, err.message);
+        // Only remove pending on terminal failures; keep for transient network errors
+        if (taskId && err instanceof TerminalGenerationError) {
+            removePendingTask(taskId);
+        }
+        resetButton();
+        showError(mesBody, err.message, triggerBtn);
         console.error('[PixAI] Generation failed:', err);
     }
 }
@@ -793,9 +925,9 @@ function insertImageIntoMessage(mesEl, imageUrl, taskId, prompt, messageIndex, o
     `);
     container.find('img').on('click', () => window.open(imageUrl, '_blank'));
 
-    // 1) Prefer replacing the exact clicked trigger button.
+    // 1) Prefer replacing the exact clicked trigger button (only if still attached to document).
     const clickedBtn = options.triggerButton ? $(options.triggerButton) : $();
-    if (clickedBtn.length) {
+    if (clickedBtn.length && document.contains(clickedBtn[0])) {
         clickedBtn.replaceWith(container);
         return;
     }
@@ -1259,12 +1391,18 @@ function buildLoadingHtml() {
 }
 
 /**
- * Show an error message in a message body.
+ * Show an error message in a message body near a reference element, or at the end.
  * @param {JQuery} mesBody
  * @param {string} message
+ * @param {JQuery} [nearEl] - Optional element to insert the error near (after).
  */
-function showError(mesBody, message) {
-    mesBody.append(`<div class="pixai-error">⚠ ${escapeHtml(message)}</div>`);
+function showError(mesBody, message, nearEl) {
+    const errorEl = $(`<div class="pixai-error">⚠ ${escapeHtml(message)}</div>`);
+    if (nearEl?.length && nearEl.closest(mesBody).length) {
+        nearEl.after(errorEl);
+    } else {
+        mesBody.append(errorEl);
+    }
 }
 
 /**
@@ -1613,10 +1751,6 @@ jQuery(async () => {
         extension_settings[MODULE_NAME] = { ...defaultSettings };
     }
     const settings = getSettings();
-    if (settings.autoGenerate) {
-        settings.autoGenerate = false;
-        saveSettingsDebounced();
-    }
 
     // Load settings HTML into SillyTavern settings panel
     try {
@@ -1709,6 +1843,9 @@ jQuery(async () => {
         const valid = await validateConnection();
         if (valid) {
             await loadPresets();
+            recoverPendingTasks().catch(err => {
+                console.warn('[PixAI] Pending task recovery failed:', err);
+            });
             if (typeof toastr !== 'undefined') {
                 toastr.success('连接验证成功');
             }
@@ -1741,15 +1878,9 @@ jQuery(async () => {
 
         $btn.data('pixaiBusy', true);
         $btn.prop('disabled', true).text('⏳ 生成中...');
-        try {
-            await doGenerate(mesEl, prompt, messageIndex, { triggerButton: $btn, markerKey, userInitiated: true });
-        } catch (err) {
-            $btn.prop('disabled', false).text('🎨 重试生成');
-            const mesBody = getMessageBody(mesEl);
-            showError(mesBody, err.message);
-        } finally {
-            $btn.data('pixaiBusy', false);
-        }
+
+        // doGenerate handles button reset on error internally
+        await doGenerate(mesEl, prompt, messageIndex, { triggerButton: $btn, markerKey });
     });
 
     // ---- Delegated Event Handlers for Image Action Buttons ----
@@ -1760,8 +1891,8 @@ jQuery(async () => {
         const prompt = container.data('prompt');
         const messageIndex = parseInt(container.data('mesid'));
         const markerKey = String(container.attr('data-marker-key') || '');
+        const originChatId = getCurrentChatId();
 
-        // Per-message mutex: prevent concurrent regen/variant
         if (inFlightByMessage.has(messageIndex)) return;
         inFlightByMessage.add(messageIndex);
 
@@ -1774,9 +1905,17 @@ jQuery(async () => {
 
             if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
                 const newUrl = pollResult.image_urls[0];
-                container.find('img').attr('src', newUrl);
-                container.attr('data-task-id', result.task_id);
-                saveImageToExtra(messageIndex, newUrl, result.task_id, prompt, markerKey);
+                if (getCurrentChatId() !== originChatId) {
+                    // Wrong chat — skip save to avoid corruption
+                    console.warn('[PixAI] Chat changed during regen, skipping');
+                } else {
+                    saveImageToExtra(messageIndex, newUrl, result.task_id, prompt, markerKey);
+                    const freshContainer = getMessageElement(messageIndex)
+                        .find(`.pixai-image-container[data-marker-key="${markerKey}"]`).first();
+                    const target = freshContainer.length ? freshContainer : container;
+                    target.find('img').attr('src', newUrl);
+                    target.attr('data-task-id', result.task_id);
+                }
                 if (typeof toastr !== 'undefined') {
                     toastr.success('重新生成完成');
                 }
@@ -1799,8 +1938,8 @@ jQuery(async () => {
         const prompt = container.data('prompt');
         const messageIndex = parseInt(container.data('mesid'));
         const markerKey = String(container.attr('data-marker-key') || '');
+        const originChatId = getCurrentChatId();
 
-        // Per-message mutex: prevent concurrent regen/variant
         if (inFlightByMessage.has(messageIndex)) return;
         inFlightByMessage.add(messageIndex);
 
@@ -1813,9 +1952,16 @@ jQuery(async () => {
 
             if (pollResult.status === 'completed' && pollResult.image_urls?.length) {
                 const newUrl = pollResult.image_urls[0];
-                container.find('img').attr('src', newUrl);
-                container.attr('data-task-id', result.task_id);
-                saveImageToExtra(messageIndex, newUrl, result.task_id, prompt, markerKey);
+                if (getCurrentChatId() !== originChatId) {
+                    console.warn('[PixAI] Chat changed during variant, skipping');
+                } else {
+                    saveImageToExtra(messageIndex, newUrl, result.task_id, prompt, markerKey);
+                    const freshContainer = getMessageElement(messageIndex)
+                        .find(`.pixai-image-container[data-marker-key="${markerKey}"]`).first();
+                    const target = freshContainer.length ? freshContainer : container;
+                    target.find('img').attr('src', newUrl);
+                    target.attr('data-task-id', result.task_id);
+                }
                 if (typeof toastr !== 'undefined') {
                     toastr.success('变体生成完成');
                 }
@@ -1940,6 +2086,10 @@ jQuery(async () => {
             const valid = await validateConnection();
             if (valid) {
                 await loadPresets();
+                // Recover any tasks interrupted by page refresh / browser close
+                recoverPendingTasks().catch(err => {
+                    console.warn('[PixAI] Pending task recovery failed:', err);
+                });
             }
         } catch (err) {
             console.warn('[PixAI] Auto-validate failed:', err);
